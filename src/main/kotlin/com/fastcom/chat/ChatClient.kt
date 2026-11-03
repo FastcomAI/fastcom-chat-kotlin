@@ -3,6 +3,7 @@ package com.fastcom.chat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.serialization.Serializable
@@ -49,6 +50,11 @@ public class ChatClient(
     private val base: String = baseUrl.trimEnd('/')
     private val tokens = TokenCache(tokenProvider)
 
+    // OkHttp silently resends a request when a pooled connection drops after
+    // sending it. For a POST that means a duplicate message (and a second bot
+    // run), so POSTs fail instead and the app decides. Shares http's pool.
+    private val postHttp: OkHttpClient = http.newBuilder().retryOnConnectionFailure(false).build()
+
     public companion object {
         /**
          * Low-trust alternative for apps with no backend: mints tokens with the
@@ -64,6 +70,14 @@ public class ChatClient(
             endUserName: String? = null,
             http: OkHttpClient = OkHttpClient(),
         ): ChatClient {
+            // The server would happily mint a full-trust token from a secret
+            // key, so this mistake would work and ship the secret key inside the
+            // app. The message never echoes the key.
+            require(!publishableKey.startsWith("sk_")) {
+                "publishableKey is a secret key (sk_...). Never put a secret key in an app: " +
+                    "mint tokens on your backend and use the tokenProvider constructor instead."
+            }
+            require(publishableKey.startsWith("pk_")) { "publishableKey must start with pk_" }
             val tokenUrl = endpoint(baseUrl.trimEnd('/'), "token")
             return ChatClient(baseUrl, http) {
                 val body = buildJsonObject {
@@ -187,7 +201,8 @@ public class ChatClient(
                 .header("Authorization", "Bearer ${tokens.get(force)}")
                 .method()
                 .build()
-            return http.newCall(request).awaitResult()
+            val client = if (request.method == "POST") postHttp else http
+            return client.newCall(request).awaitResult()
         }
         val first = send(force = false)
         return if (first.code == 401) send(force = true) else first
@@ -225,6 +240,7 @@ public class ChatClient(
         var forceRefresh = false
         while (true) {
             if (attempt > 0) setState(StreamState.RECONNECTING)
+            var minDelayMillis = 0L
             try {
                 val token = tokens.get(forceRefresh)
                 forceRefresh = false
@@ -257,13 +273,17 @@ public class ChatClient(
                     }
                 }
                 // A clean end: the server closes streams on deploy. Reconnect promptly.
-            } catch (e: CancellationException) {
-                throw e
             } catch (e: Exception) {
+                // A CancellationException is either the collector cancelling
+                // (ensureActive rethrows it) or one the token provider threw,
+                // e.g. its own withTimeout. The latter is an ordinary failure.
+                if (e is CancellationException) ensureActive()
+                // A rate limit (on the stream or on minting its token) says how long to wait.
+                (e as? ChatApiException)?.retryAfter?.let { minDelayMillis = it * 1000L }
                 send(ChatStreamEvent.Error(e))
             }
             setState(StreamState.RECONNECTING)
-            delay(backoffMillis(attempt, options.maxBackoffMillis))
+            delay(maxOf(backoffMillis(attempt, options.maxBackoffMillis), minDelayMillis))
             attempt += 1
         }
     }
